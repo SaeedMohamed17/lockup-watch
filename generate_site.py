@@ -1,331 +1,245 @@
-"""
-generate_site.py
------------------
-Reads lockups.db and generates a single static index.html styled to
-closely match openinsider.com's look: tiny dense table, classic blue
-hyperlinks, thin bordered cells, plain-text nav, no modern card/shadow
-styling. Function over form.
- 
-Run this AFTER lockup_tracker.py has updated the database.
- 
-    python generate_site.py
- 
-Output: index.html
-"""
- 
+# Pulls recent IPO filings (424B4) from SEC EDGAR and estimates lockup expiry dates
+
+import re
+import requests
+import csv
 import sqlite3
-from datetime import datetime, date, timezone
- 
+import time
+from datetime import datetime, timedelta, timezone
+
+# --- CONFIG -----------------------------------------------------------
+
+HEADERS = {
+    "User-Agent": "LockupTracker saeed.mohamed@torontomu.ca"
+}
+
+SEARCH_URL = "https://efts.sec.gov/LATEST/search-index"
+
+DEFAULT_LOCKUP_DAYS = 180
+LOOKBACK_DAYS = 365
+
+OUTPUT_CSV = "lockup_tracker_output.csv"
 DB_FILE = "lockups.db"
-OUTPUT_HTML = "index.html"
- 
- 
-def fetch_rows(db_file=DB_FILE):
+
+SPAC_KEYWORDS = [
+    "acquisition corp", "acquisition co", "acquisition i", "acquisition ii",
+    "acquisition iii", "acquisition iv", "acquisition v", "blank check",
+    "capital partners", "holdings corp", "spac", "merger corp",
+]
+
+
+# --- CORE FUNCTIONS -----------------------------------------------------
+
+def fetch_recent_424b4_filings(lookback_days=LOOKBACK_DAYS):
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=lookback_days)
+
+    params = {
+        "q": "\"lock-up\"",
+        "forms": "424B4",
+        "dateRange": "custom",
+        "startdt": start_date.strftime("%Y-%m-%d"),
+        "enddt": end_date.strftime("%Y-%m-%d"),
+    }
+
+    all_hits = []
+    frm = 0
+    page_size = 100
+
+    while True:
+        params["from"] = frm
+        resp = requests.get(SEARCH_URL, headers=HEADERS, params=params, timeout=30)
+
+        if resp.status_code != 200:
+            print(f"ERROR: SEC API returned status {resp.status_code}")
+            print(resp.text[:500])
+            break
+
+        data = resp.json()
+        hits = data.get("hits", {}).get("hits", [])
+
+        if not hits:
+            break
+
+        all_hits.extend(hits)
+        print(f"  fetched {len(hits)} filings (total so far: {len(all_hits)})")
+
+        if len(hits) < page_size:
+            break
+
+        frm += page_size
+        time.sleep(0.3)
+
+    return all_hits
+
+
+def clean_company_and_ticker(raw_name):
+    ticker = None
+
+    matches = re.findall(r"\(([^()]+)\)", raw_name)
+    for m in matches:
+        if not m.strip().upper().startswith("CIK"):
+            ticker = m.strip()
+
+    company_clean = re.sub(r"\s*\([^()]*\)", "", raw_name).strip()
+
+    return company_clean, ticker
+
+
+def is_likely_spac(company_name):
+    name_lower = company_name.lower()
+    return any(keyword in name_lower for keyword in SPAC_KEYWORDS)
+
+
+def parse_filing(hit):
+    source = hit.get("_source", {})
+
+    company_names = source.get("display_names", ["Unknown"])
+    raw_name = company_names[0] if company_names else "Unknown"
+    company_clean, ticker = clean_company_and_ticker(raw_name)
+
+    filed_at = source.get("file_date")
+    form_type = source.get("form")
+    cik = source.get("ciks", [None])[0]
+
+    accession_no = hit.get("_id", "").split(":")[0]
+
+    lockup_expiration = None
+    if filed_at:
+        try:
+            filed_date_obj = datetime.strptime(filed_at, "%Y-%m-%d")
+            lockup_expiration = (
+                filed_date_obj + timedelta(days=DEFAULT_LOCKUP_DAYS)
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    return {
+        "company": company_clean,
+        "ticker": ticker,
+        "cik": cik,
+        "is_spac": is_likely_spac(company_clean),
+        "form_type": form_type,
+        "filed_date": filed_at,
+        "accession_no": accession_no,
+        "estimated_lockup_expiration": lockup_expiration,
+        "lockup_days_assumed": DEFAULT_LOCKUP_DAYS,
+    }
+
+
+def dedupe_rows(rows):
+    best_by_cik = {}
+    for row in rows:
+        cik = row["cik"]
+        if cik not in best_by_cik:
+            best_by_cik[cik] = row
+        else:
+            existing = best_by_cik[cik]
+            if (row["filed_date"] or "9999") < (existing["filed_date"] or "9999"):
+                best_by_cik[cik] = row
+    return list(best_by_cik.values())
+
+
+def init_db(db_file=DB_FILE):
     conn = sqlite3.connect(db_file)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute("""
-        SELECT company, ticker, is_spac, filed_date, cik, accession_no,
-               estimated_lockup_expiration, lockup_days_assumed
-        FROM lockups
-        ORDER BY estimated_lockup_expiration ASC
-    """).fetchall()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS lockups (
+            cik TEXT PRIMARY KEY,
+            company TEXT,
+            ticker TEXT,
+            is_spac INTEGER,
+            form_type TEXT,
+            filed_date TEXT,
+            accession_no TEXT,
+            estimated_lockup_expiration TEXT,
+            lockup_days_assumed INTEGER,
+            last_updated TEXT
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def save_to_db(rows, db_file=DB_FILE):
+    conn = init_db(db_file)
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    for row in rows:
+        conn.execute("""
+            INSERT INTO lockups
+                (cik, company, ticker, is_spac, form_type, filed_date,
+                 accession_no, estimated_lockup_expiration,
+                 lockup_days_assumed, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(cik) DO UPDATE SET
+                company=excluded.company,
+                ticker=excluded.ticker,
+                is_spac=excluded.is_spac,
+                form_type=excluded.form_type,
+                filed_date=excluded.filed_date,
+                accession_no=excluded.accession_no,
+                estimated_lockup_expiration=excluded.estimated_lockup_expiration,
+                lockup_days_assumed=excluded.lockup_days_assumed,
+                last_updated=excluded.last_updated
+        """, (
+            row["cik"], row["company"], row["ticker"], int(row["is_spac"]),
+            row["form_type"], row["filed_date"], row["accession_no"],
+            row["estimated_lockup_expiration"], row["lockup_days_assumed"], now
+        ))
+
+    conn.commit()
     conn.close()
-    return rows
- 
- 
-def days_until(date_str):
-    if not date_str:
-        return None
-    try:
-        target = datetime.strptime(date_str, "%Y-%m-%d").date()
-        return (target - date.today()).days
-    except ValueError:
-        return None
- 
- 
-def edgar_filing_url(cik, accession_no):
-    """
-    Build a real link to the actual filing on SEC EDGAR, e.g.:
-    https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=...
-    We link straight to the filing index page using CIK + accession number.
-    """
-    if not cik or not accession_no:
-        return None
-    acc_nodash = accession_no.replace("-", "")
-    cik_int = str(int(cik))  # strip leading zeros
-    return f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{acc_nodash}/"
- 
- 
-def build_row_html(row, idx):
-    ticker = row["ticker"].split(",")[0].strip() if row["ticker"] else "—"
-    company = row["company"]
-    filed = row["filed_date"] or "—"
-    expiry = row["estimated_lockup_expiration"] or "—"
-    spac_tag = ' <span class="tag">SPAC</span>' if row["is_spac"] else ""
- 
-    filing_url = edgar_filing_url(row["cik"], row["accession_no"])
-    link_open = f'<a href="{filing_url}" target="_blank" rel="noopener">' if filing_url else "<span>"
-    link_close = "</a>" if filing_url else "</span>"
- 
-    d = days_until(row["estimated_lockup_expiration"])
-    if d is None:
-        countdown, cclass = "—", ""
-    elif d < 0:
-        countdown, cclass = "expired", "neg"
-    elif d <= 14:
-        countdown, cclass = f"{d}d", "soon"
-    else:
-        countdown, cclass = f"{d}d", ""
- 
-    return f"""    <tr class="row" data-spac="{1 if row['is_spac'] else 0}" data-days="{d if d is not None else ''}">
-      <td class="num">{idx}</td>
-      <td class="date">{filed}</td>
-      <td class="ticker">{link_open}{ticker}{link_close}</td>
-      <td class="company">{link_open}{company}{link_close}{spac_tag}</td>
-      <td class="date">{expiry}</td>
-      <td class="lockup-len">{row['lockup_days_assumed']}d</td>
-      <td class="countdown {cclass}">{countdown}</td>
-    </tr>"""
- 
- 
-def generate_html(rows):
-    total = len(rows)
-    real_count = sum(1 for r in rows if not r["is_spac"])
-    spac_count = total - real_count
-    generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
- 
-    rows_html = "\n".join(build_row_html(r, i + 1) for i, r in enumerate(rows))
- 
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Lockup Watch - IPO Lockup Expiration Screener</title>
-<style>
-  body {{
-    margin: 0;
-    padding: 0;
-    background: #ffffff;
-    color: #000000;
-    font-family: Arial, Helvetica, sans-serif;
-    font-size: 11px;
-  }}
-  a {{
-    color: #0000EE;
-    text-decoration: none;
-  }}
-  a:hover {{ text-decoration: underline; }}
- 
-  #topnav {{
-    background: #f0f0f0;
-    border-bottom: 1px solid #999;
-    padding: 3px 8px;
-    font-size: 11px;
-  }}
-  #topnav a {{
-    margin-right: 14px;
-    color: #0000EE;
-  }}
-  #topnav .brand {{
-    font-weight: bold;
-    color: #000;
-    margin-right: 20px;
-    font-size: 13px;
-  }}
- 
-  h1 {{
-    font-size: 14px;
-    margin: 6px 8px 1px 8px;
-  }}
-  .subtitle {{
-    margin: 0 8px 4px 8px;
-    color: #444;
-    font-size: 11px;
-  }}
-  .stats-bar {{
-    margin: 0 8px 4px 8px;
-    font-size: 11px;
-    color: #333;
-  }}
-  .stats-bar b {{ color: #000; }}
- 
-  table {{
-    border-collapse: collapse;
-    width: 100%;
-    margin: 0 0 20px 0;
-    table-layout: fixed;
-  }}
-  th {{
-    background: #d9d9d9;
-    border: 1px solid #999;
-    padding: 3px 6px;
-    text-align: left;
-    font-size: 11px;
-    font-weight: bold;
-    white-space: nowrap;
-  }}
-  td {{
-    border: 1px solid #ccc;
-    padding: 3px 6px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }}
-  tr:nth-child(even) td {{
-    background: #f5f5f5;
-  }}
-  tr:hover td {{
-    background: #ffffcc;
-  }}
- 
-  th:nth-child(1), td.num {{ width: 3%; }}
-  th:nth-child(2), td.date:nth-of-type(1) {{ width: 10%; }}
-  th:nth-child(3), td.ticker {{ width: 8%; }}
-  th:nth-child(4), td.company {{ width: 44%; }}
-  th:nth-child(5) {{ width: 12%; }}
-  th:nth-child(6), td.lockup-len {{ width: 8%; }}
-  th:nth-child(7), td.countdown {{ width: 8%; }}
- 
-  td.num {{ color: #888; text-align: right; }}
-  td.date {{ font-family: Consolas, monospace; }}
-  td.ticker {{ font-weight: bold; }}
-  td.company {{ white-space: normal; overflow: visible; }}
-  td.lockup-len {{ text-align: right; color: #555; }}
-  td.countdown {{ text-align: right; font-weight: bold; }}
-  td.countdown.soon {{ color: #a00; }}
-  td.countdown.neg {{ color: #888; font-weight: normal; }}
- 
-  .tag {{
-    font-size: 9px;
-    font-weight: bold;
-    color: #888;
-    border: 1px solid #ccc;
-    padding: 0 3px;
-  }}
- 
-  #topnav a.active {{
-    font-weight: bold;
-    text-decoration: underline;
-    color: #000;
-  }}
- 
-  #result-count {{
-    margin: 0 8px 4px 8px;
-    font-size: 11px;
-    color: #555;
-  }}
- 
-  footer {{
-    margin: 10px 8px 30px 8px;
-    font-size: 10px;
-    color: #777;
-  }}
-</style>
-</head>
-<body>
- 
-<div id="topnav">
-  <span class="brand">Lockup Watch</span>
-  <a href="#" onclick="filterRows('all'); return false;" id="nav-all">All IPOs</a>
-  <a href="#" onclick="filterRows('real'); return false;" id="nav-real">Operating Companies Only</a>
-  <a href="#" onclick="filterRows('spac'); return false;" id="nav-spac">SPACs Only</a>
-  <a href="#" onclick="filterRows('week'); return false;" id="nav-week">Expiring This Week</a>
-  <a href="#" onclick="filterRows('month'); return false;" id="nav-month">Expiring This Month</a>
-</div>
- 
-<h1>IPO Lockup Expiration Screener</h1>
-<div class="subtitle">Tracks Form 424B4 IPO prospectus filings from SEC EDGAR and estimates each company's insider lockup expiration date.</div>
- 
-<div class="stats-bar">
-  <b>{total}</b> filings tracked &nbsp;|&nbsp;
-  <b>{real_count}</b> operating companies &nbsp;|&nbsp;
-  <b>{spac_count}</b> SPACs &nbsp;|&nbsp;
-  updated <b>{generated_at}</b>
-</div>
- 
-<div id="result-count"></div>
- 
-<table>
-  <thead>
-    <tr>
-      <th>#</th>
-      <th>Filed</th>
-      <th>Ticker</th>
-      <th>Company Name</th>
-      <th>Est. Lockup Expiry</th>
-      <th>Lockup Len</th>
-      <th>Countdown</th>
-    </tr>
-  </thead>
-  <tbody>
-{rows_html}
-  </tbody>
-</table>
- 
-<footer>
-  Data source: SEC EDGAR full-text search (Form 424B4 filings). Lockup dates are estimates
-  (filing date + assumed lockup length) and may not reflect actual terms such as early-release
-  clauses. Not investment advice.
-</footer>
- 
-<script>
-  function filterRows(mode) {{
-    const rows = document.querySelectorAll("tbody tr.row");
-    let shown = 0;
- 
-    rows.forEach(row => {{
-      const isSpac = row.dataset.spac === "1";
-      const days = row.dataset.days === "" ? null : parseInt(row.dataset.days, 10);
-      let visible = true;
- 
-      if (mode === "real") visible = !isSpac;
-      else if (mode === "spac") visible = isSpac;
-      else if (mode === "week") visible = days !== null && days >= 0 && days <= 7;
-      else if (mode === "month") visible = days !== null && days >= 0 && days <= 30;
-      // mode === "all" -> visible stays true
- 
-      row.style.display = visible ? "" : "none";
-      if (visible) shown++;
-    }});
- 
-    document.getElementById("result-count").textContent =
-      "Showing " + shown + " of " + rows.length + " filings";
- 
-    document.querySelectorAll("#topnav a").forEach(a => a.classList.remove("active"));
-    document.getElementById("nav-" + mode).classList.add("active");
-  }}
- 
-  // default view on page load
-  filterRows("all");
-</script>
- 
-</body>
-</html>
-"""
- 
- 
-def is_expired(date_str):
-    d = days_until(date_str)
-    return d is not None and d < 0
- 
- 
-def main():
-    all_rows = fetch_rows()
-    if not all_rows:
-        print("No data in database yet - run lockup_tracker.py first.")
+    print(f"Saved {len(rows)} rows to database ({db_file})")
+
+
+def save_to_csv(rows, filename=OUTPUT_CSV):
+    if not rows:
+        print("No rows to save.")
         return
- 
-    active_rows = [r for r in all_rows if not is_expired(r["estimated_lockup_expiration"])]
-    expired_count = len(all_rows) - len(active_rows)
- 
-    html = generate_html(active_rows)
-    with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
-        f.write(html)
- 
-    print(f"Generated {OUTPUT_HTML} with {len(active_rows)} active rows "
-          f"({expired_count} expired filings excluded).")
- 
- 
+
+    fieldnames = list(rows[0].keys())
+    with open(filename, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"\nSaved {len(rows)} rows to {filename}")
+
+
+# --- MAIN ----------------------------------------------------------------
+
+def main():
+    print(f"Fetching 424B4 filings from the last {LOOKBACK_DAYS} days...")
+    raw_hits = fetch_recent_424b4_filings()
+
+    print(f"\nTotal filings found: {len(raw_hits)}")
+
+    parsed_rows = [parse_filing(hit) for hit in raw_hits]
+    parsed_rows = dedupe_rows(parsed_rows)
+
+    parsed_rows.sort(
+        key=lambda r: r["estimated_lockup_expiration"] or "9999-99-99"
+    )
+
+    real_companies = [r for r in parsed_rows if not r["is_spac"]]
+    spacs = [r for r in parsed_rows if r["is_spac"]]
+
+    save_to_csv(parsed_rows, OUTPUT_CSV)
+    save_to_csv(real_companies, "lockup_tracker_real_companies_only.csv")
+    save_to_db(parsed_rows)
+
+    print(f"\nAfter dedup: {len(parsed_rows)} unique companies")
+    print(f"  -> {len(real_companies)} likely real operating companies")
+    print(f"  -> {len(spacs)} likely SPACs (flagged, not removed)")
+
+    print("\n--- Preview: real companies, soonest lockup expiry first ---")
+    for row in real_companies[:10]:
+        ticker_str = f"({row['ticker']})" if row["ticker"] else ""
+        print(
+            f"{row['company']:<35} {ticker_str:<15} filed {row['filed_date']} "
+            f"-> est. lockup expiry {row['estimated_lockup_expiration']}"
+        )
+
+
 if __name__ == "__main__":
     main()
