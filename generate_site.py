@@ -1,7 +1,6 @@
 # Reads lockups.db and builds index.html
 # Run after lockup_tracker.py
 
-
 import sqlite3
 from datetime import datetime, date, timezone
  
