@@ -60,7 +60,11 @@ def build_row_html(row, idx):
     else:
         countdown, cclass = f"{d}d", ""
 
-    return f"""    <tr class="row" data-spac="{1 if row['is_spac'] else 0}" data-days="{d if d is not None else ''}">
+    row_class = "row"
+    if cclass == "soon":
+        row_class += " row-soon"
+
+    return f"""    <tr class="{row_class}" data-spac="{1 if row['is_spac'] else 0}" data-days="{d if d is not None else ''}">
       <td class="num">{idx}</td>
       <td class="date">{filed}</td>
       <td class="ticker">{link_open}{ticker}{link_close}</td>
@@ -160,6 +164,12 @@ def generate_html(rows):
   }}
   tr:hover td {{
     background: #ffffcc;
+  }}
+  tr.row-soon td {{
+    background: #ffe0e0;
+  }}
+  tr.row-soon:hover td {{
+    background: #ffc9c9;
   }}
 
   th:nth-child(1), td.num {{ width: 3%; }}
